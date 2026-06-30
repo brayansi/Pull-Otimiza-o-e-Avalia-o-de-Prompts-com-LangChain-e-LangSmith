@@ -20,11 +20,11 @@ Configure o provider no arquivo .env através da variável LLM_PROVIDER.
 import os
 import sys
 import json
+import argparse
 from typing import List, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
-from langsmith import Client
-from langchain import hub
+from langsmith import Client, evaluate as ls_evaluate
 from langchain_core.prompts import ChatPromptTemplate
 from utils import check_env_vars, format_score, print_section_header, get_llm as get_configured_llm
 from metrics import evaluate_f1_score, evaluate_clarity, evaluate_precision
@@ -105,7 +105,8 @@ def create_evaluation_dataset(client: Client, dataset_name: str, jsonl_path: str
 def pull_prompt_from_langsmith(prompt_name: str) -> ChatPromptTemplate:
     try:
         print(f"   Puxando prompt do LangSmith Hub: {prompt_name}")
-        prompt = hub.pull(prompt_name)
+        client = Client()
+        prompt = client.pull_prompt(prompt_name, dangerously_pull_public_prompt=True)
         print(f"   ✓ Prompt carregado com sucesso")
         return prompt
 
@@ -187,45 +188,92 @@ def evaluate_prompt(
 
     try:
         prompt_template = pull_prompt_from_langsmith(prompt_name)
-
-        examples = list(client.list_examples(dataset_name=dataset_name))
-        print(f"   Dataset: {len(examples)} exemplos")
-
         llm = get_llm()
 
-        f1_scores = []
-        clarity_scores = []
-        precision_scores = []
+        # --- Target: executa o prompt e retorna a resposta ---
+        def target(inputs: Dict) -> Dict:
+            chain = prompt_template | llm
+            response = chain.invoke(inputs)
+            return {"output": response.content}
 
-        print("   Avaliando exemplos...")
+        # --- Evaluator único: calcula todas as 5 métricas por exemplo ---
+        # Retorna lista para publicar cada score individualmente no LangSmith.
+        def eval_all_metrics(run, example) -> List[Dict]:
+            answer    = (run.outputs    or {}).get("output",    "")
+            reference = (example.outputs or {}).get("reference", "")
+            question  = (example.inputs  or {}).get("bug_report", "")
 
-        for i, example in enumerate(examples, 1):
-            result = evaluate_prompt_on_example(prompt_template, example, llm)
+            f1        = evaluate_f1_score(question, answer, reference)["score"]
+            clarity   = evaluate_clarity(question, answer, reference)["score"]
+            precision = evaluate_precision(question, answer, reference)["score"]
 
-            if result["answer"]:
-                f1 = evaluate_f1_score(result["question"], result["answer"], result["reference"])
-                clarity = evaluate_clarity(result["question"], result["answer"], result["reference"])
-                precision = evaluate_precision(result["question"], result["answer"], result["reference"])
+            return [
+                {"key": "f1_score",     "score": f1},
+                {"key": "clarity",      "score": clarity},
+                {"key": "precision",    "score": precision},
+                {"key": "helpfulness",  "score": round((clarity + precision) / 2, 4)},
+                {"key": "correctness",  "score": round((f1 + precision) / 2, 4)},
+            ]
 
-                f1_scores.append(f1["score"])
-                clarity_scores.append(clarity["score"])
-                precision_scores.append(precision["score"])
+        experiment_prefix = prompt_name.split("/")[-1]
+        print(f"   Iniciando experimento '{experiment_prefix}' no LangSmith...")
+        print("   Os resultados aparecerão na aba Experiments do dataset.\n")
 
-                print(f"      [{i}/{len(examples)}] F1:{f1['score']:.2f} Clarity:{clarity['score']:.2f} Precision:{precision['score']:.2f}")
+        results = ls_evaluate(
+            target,
+            data=dataset_name,
+            evaluators=[eval_all_metrics],
+            experiment_prefix=experiment_prefix,
+            client=client,
+            metadata={"prompt_name": prompt_name},
+        )
 
-        avg_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
-        avg_clarity = sum(clarity_scores) / len(clarity_scores) if clarity_scores else 0.0
-        avg_precision = sum(precision_scores) / len(precision_scores) if precision_scores else 0.0
+        # Agrega os scores coletados por exemplo
+        metric_keys = ["f1_score", "clarity", "precision", "helpfulness", "correctness"]
+        collected: Dict[str, List[float]] = {k: [] for k in metric_keys}
+        count = 0
 
-        avg_helpfulness = (avg_clarity + avg_precision) / 2
-        avg_correctness = (avg_f1 + avg_precision) / 2
+        for row in results:
+            count += 1
+            eval_results = row.get("evaluation_results", {})
+            evals = (
+                eval_results.results
+                if hasattr(eval_results, "results")
+                else eval_results.get("results", [])
+            )
+
+            row_scores: Dict[str, float] = {}
+            for er in evals:
+                key   = getattr(er, "key",   None)
+                score = getattr(er, "score", None)
+                if key in collected and score is not None:
+                    collected[key].append(score)
+                    row_scores[key] = score
+
+            print(
+                f"      [{count}] "
+                f"F1:{row_scores.get('f1_score', 0):.2f}  "
+                f"Clarity:{row_scores.get('clarity', 0):.2f}  "
+                f"Precision:{row_scores.get('precision', 0):.2f}  "
+                f"Helpfulness:{row_scores.get('helpfulness', 0):.2f}  "
+                f"Correctness:{row_scores.get('correctness', 0):.2f}"
+            )
+
+        def _avg(lst: List[float]) -> float:
+            return sum(lst) / len(lst) if lst else 0.0
+
+        avg_f1          = _avg(collected["f1_score"])
+        avg_clarity     = _avg(collected["clarity"])
+        avg_precision   = _avg(collected["precision"])
+        avg_helpfulness = _avg(collected["helpfulness"])
+        avg_correctness = _avg(collected["correctness"])
 
         return {
             "helpfulness": round(avg_helpfulness, 4),
             "correctness": round(avg_correctness, 4),
-            "f1_score": round(avg_f1, 4),
-            "clarity": round(avg_clarity, 4),
-            "precision": round(avg_precision, 4)
+            "f1_score":    round(avg_f1,          4),
+            "clarity":     round(avg_clarity,      4),
+            "precision":   round(avg_precision,    4),
         }
 
     except Exception as e:
@@ -233,9 +281,9 @@ def evaluate_prompt(
         return {
             "helpfulness": 0.0,
             "correctness": 0.0,
-            "f1_score": 0.0,
-            "clarity": 0.0,
-            "precision": 0.0
+            "f1_score":    0.0,
+            "clarity":     0.0,
+            "precision":   0.0,
         }
 
 
@@ -274,7 +322,53 @@ def display_results(prompt_name: str, scores: Dict[str, float]) -> bool:
     return passed
 
 
+DEFAULT_PROMPT = "bug_to_user_story_v2"
+
+
+def parse_args() -> argparse.Namespace:
+    """Processa argumentos da linha de comando."""
+    from prompt_registry import registry
+
+    parser = argparse.ArgumentParser(
+        description="Avalia um prompt do LangSmith Hub contra o dataset de referência.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--prompt",
+        metavar="ID",
+        default=DEFAULT_PROMPT,
+        help=(
+            "ID do prompt a avaliar (conforme registry.yaml).\n"
+            f"Disponíveis: {registry.list_prompts()}\n"
+            f"Padrão: {DEFAULT_PROMPT}"
+        ),
+    )
+    parser.add_argument(
+        "--commit",
+        metavar="HASH",
+        default=None,
+        help=(
+            "Hash de commit específico do LangSmith Hub a avaliar.\n"
+            "Ex: --commit fe7ca32c\n"
+            "Quando informado, sobrepõe a versão mais recente do prompt."
+        ),
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
+    from prompt_registry import registry
+    available = registry.list_prompts()
+
+    if args.prompt not in available:
+        print(f"❌ Prompt não encontrado no registry: '{args.prompt}'")
+        print(f"   Disponíveis: {available}")
+        return 1
+
+    prompt_ids = [args.prompt]
+
     print_section_header("AVALIAÇÃO DE PROMPTS OTIMIZADOS")
 
     provider = os.getenv("LLM_PROVIDER", "openai")
@@ -307,22 +401,23 @@ def main():
     dataset_name = f"{project_name}-eval"
     create_evaluation_dataset(client, dataset_name, jsonl_path)
 
-    print("\n" + "=" * 70)
-    print("PROMPTS PARA AVALIAR")
-    print("=" * 70)
-    print("\nEste script irá puxar prompts do LangSmith Hub.")
-    print("Certifique-se de ter feito push dos prompts antes de avaliar:")
-    print("  python src/push_prompts.py\n")
-
     username = os.getenv("USERNAME_LANGSMITH_HUB", "")
     if not username:
         print("❌ USERNAME_LANGSMITH_HUB não configurada no .env")
         print("   Configure seu username do LangSmith Hub antes de continuar.")
         return 1
 
-    prompts_to_evaluate = [
-        f"{username}/bug_to_user_story_v2",
-    ]
+    if args.commit:
+        prompts_to_evaluate = [f"{username}/{pid}:{args.commit}" for pid in prompt_ids]
+    else:
+        prompts_to_evaluate = [f"{username}/{pid}" for pid in prompt_ids]
+
+    print("\n" + "=" * 70)
+    print("PROMPTS PARA AVALIAR")
+    print("=" * 70)
+    for p in prompts_to_evaluate:
+        print(f"  • {p}")
+    print()
 
     all_passed = True
     evaluated_count = 0
@@ -373,8 +468,8 @@ def main():
 
     if all_passed:
         print("✅ Todos os prompts atingiram todas as métricas >= 0.8!")
-        print(f"\n✓ Confira os resultados em:")
-        print(f"  https://smith.langchain.com/projects/{project_name}")
+        print(f"\n✓ Confira os gráficos em:")
+        print(f"  https://smith.langchain.com → Datasets & Experiments → {dataset_name} → aba Experiments")
         print("\nPróximos passos:")
         print("1. Documente o processo no README.md")
         print("2. Capture screenshots das avaliações")

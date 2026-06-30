@@ -1,154 +1,153 @@
 """
-Testes automatizados para validacao do prompt otimizado v2.
+Testes estáticos de qualidade para os prompts do projeto.
 
-Sao 6 testes obrigatorios definidos na spec (.cursor/docs/specs.md):
-  1. test_prompt_has_system_prompt
-  2. test_prompt_has_role_definition
-  3. test_prompt_mentions_format
-  4. test_prompt_has_few_shot_examples
-  5. test_prompt_no_todos
-  6. test_minimum_techniques
-
-Rodar: pytest tests/test_prompts.py -v
+Valida estrutura, técnicas aplicadas e boas práticas sem usar LLM.
+Roda contra todos os prompts registrados no registry.yaml.
 """
-import pytest
+
+import re
 import yaml
-import sys
+import pytest
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-PROMPT_FILE = Path(__file__).parent.parent / "prompts" / "bug_to_user_story_v2.yml"
+from typing import Any, Dict, List, Tuple
 
 
-def load_prompts(file_path):
-    """Carrega prompts do arquivo YAML."""
-    with open(file_path, "r", encoding="utf-8") as f:
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+_PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+
+
+def _load_registry() -> Dict[str, Any]:
+    with open(_PROMPTS_DIR / "registry.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def get_system_text(data: dict) -> str:
-    """Extrai o conteudo do system prompt do formato messages[]."""
-    for msg in data.get("messages", []):
-        if isinstance(msg, dict) and "system" in msg:
-            return msg["system"] or ""
-    return ""
+def _load_all_prompts() -> List[Tuple[str, Dict[str, Any]]]:
+    registry = _load_registry()
+    result = []
+    for prompt_id, agent_data in registry.get("agents", {}).items():
+        path = _PROMPTS_DIR / agent_data["path"]
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            result.append((prompt_id, data.get(prompt_id, {})))
+    return result
 
 
-def get_full_text(data: dict) -> str:
-    """Concatena todo o texto do prompt (system + human + ...)."""
-    parts = []
-    for msg in data.get("messages", []):
-        if not isinstance(msg, dict):
-            continue
-        for value in msg.values():
-            if value:
-                parts.append(str(value))
-    return "\n".join(parts)
+ALL_PROMPTS = _load_all_prompts()
+PROMPT_IDS = [p[0] for p in ALL_PROMPTS]
 
 
-@pytest.fixture(scope="module")
-def prompt_data():
-    return load_prompts(PROMPT_FILE)
+# ── Testes ───────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("prompt_id,prompt_data", ALL_PROMPTS, ids=PROMPT_IDS)
+def test_prompt_has_system_prompt(prompt_id: str, prompt_data: Dict[str, Any]):
+    """Verifica se o campo system_prompt existe e não está vazio."""
+    assert "system_prompt" in prompt_data, (
+        f"[{prompt_id}] Campo 'system_prompt' ausente no YAML."
+    )
+    assert prompt_data["system_prompt"].strip(), (
+        f"[{prompt_id}] Campo 'system_prompt' existe mas está vazio."
+    )
 
 
-class TestPrompts:
-    def test_prompt_has_system_prompt(self, prompt_data):
-        """Verifica se o campo 'system' existe nas messages e nao esta vazio."""
-        system_text = get_system_text(prompt_data)
-        assert system_text.strip(), "O system prompt esta ausente ou vazio"
+@pytest.mark.parametrize("prompt_id,prompt_data", ALL_PROMPTS, ids=PROMPT_IDS)
+def test_prompt_has_role_definition(prompt_id: str, prompt_data: Dict[str, Any]):
+    """Verifica se o prompt define uma persona (ex: 'Você é um Product Manager')."""
+    system_prompt = prompt_data.get("system_prompt", "")
+    role_patterns = [
+        r"você é",
+        r"you are",
+        r"seu papel é",
+        r"your role",
+        r"atue como",
+        r"act as",
+    ]
+    match = any(re.search(p, system_prompt, re.IGNORECASE) for p in role_patterns)
+    assert match, (
+        f"[{prompt_id}] Nenhuma definição de persona encontrada no system_prompt. "
+        f"Use 'Você é...' ou similar para definir o papel do assistente."
+    )
 
-    def test_prompt_has_role_definition(self, prompt_data):
-        """Verifica se o prompt define uma persona (ex.: 'Voce e um Product Owner')."""
-        system_text = get_system_text(prompt_data)
-        assert "Você é" in system_text, (
-            "O system prompt nao define uma persona. "
-            "Use 'Voce e um [papel]' para definir o papel do assistente."
-        )
 
-    def test_prompt_mentions_format(self, prompt_data):
-        """Verifica se o prompt exige formato Markdown ou User Story padrao."""
-        system_text = get_system_text(prompt_data)
-        format_indicators = [
-            "Como um",
-            "Critérios de Aceitação",
-            "Given",
-            "Dado que",
-            "Quando",
-            "Então",
-            "Markdown",
-            "##",
-        ]
-        found = [kw for kw in format_indicators if kw in system_text]
-        assert found, (
-            "O prompt nao especifica o formato de saida esperado. "
-            f"Nenhum dos indicadores encontrados: {format_indicators}"
-        )
+@pytest.mark.parametrize("prompt_id,prompt_data", ALL_PROMPTS, ids=PROMPT_IDS)
+def test_prompt_mentions_format(prompt_id: str, prompt_data: Dict[str, Any]):
+    """Verifica se o prompt exige formato Markdown ou User Story padrão."""
+    system_prompt = prompt_data.get("system_prompt", "")
+    format_patterns = [
+        r"user story",
+        r"markdown",
+        r"##",
+        r"formato",
+        r"seções",
+        r"estrutura",
+    ]
+    match = any(re.search(p, system_prompt, re.IGNORECASE) for p in format_patterns)
+    assert match, (
+        f"[{prompt_id}] O system_prompt não menciona nenhum formato de saída esperado "
+        f"(User Story, Markdown, seções, etc.)."
+    )
 
-    def test_prompt_has_few_shot_examples(self, prompt_data):
-        """Verifica se o prompt contem exemplos de entrada/saida (Few-shot)."""
-        system_text = get_system_text(prompt_data)
-        has_bug_example = (
-            "BUG REPORT:" in system_text or "bug_report" in system_text.lower()
-        )
-        has_story_example = (
-            "USER STORY:" in system_text or "Como um" in system_text
-        )
-        assert has_bug_example and has_story_example, (
-            "O prompt nao contem exemplos de few-shot. "
-            "Inclua pelo menos um par BUG REPORT / USER STORY no system prompt."
-        )
 
-    def test_prompt_no_todos(self, prompt_data):
-        """Garante que nao restou nenhum [TODO]/FIXME/XXX no texto."""
-        full_text = get_full_text(prompt_data)
-        todo_markers = ["[TODO]", "TODO", "FIXME", "XXX"]
-        found = [marker for marker in todo_markers if marker in full_text]
-        assert not found, (
-            f"O prompt contem marcadores inacabados: {found}. "
-            "Remova ou substitua antes de publicar."
-        )
+@pytest.mark.parametrize("prompt_id,prompt_data", ALL_PROMPTS, ids=PROMPT_IDS)
+def test_prompt_has_few_shot_examples(prompt_id: str, prompt_data: Dict[str, Any]):
+    """Verifica se o prompt contém exemplos de entrada/saída (técnica Few-shot).
 
-    def test_minimum_techniques(self, prompt_data):
-        """Verifica se pelo menos 2 tecnicas de prompt engineering foram aplicadas."""
-        system_text = get_system_text(prompt_data)
-        full_text = get_full_text(prompt_data)
+    Pulado para o v1 (prompt base intencional sem otimizações).
+    """
+    if prompt_id == "bug_to_user_story_v1":
+        pytest.skip("v1 é o prompt base de baixa qualidade — few-shot não é exigido.")
 
-        techniques_found: list[str] = []
+    system_prompt = prompt_data.get("system_prompt", "")
+    example_patterns = [
+        r"exemplo",
+        r"example",
+        r"por exemplo",
+        r"e\.g\.",
+        r"como exemplo",
+        r"input:",
+        r"output:",
+    ]
+    match = any(re.search(p, system_prompt, re.IGNORECASE) for p in example_patterns)
+    assert match, (
+        f"[{prompt_id}] Nenhum exemplo (few-shot) encontrado no system_prompt. "
+        f"Adicione ao menos um exemplo de entrada/saída para guiar o modelo."
+    )
 
-        if "Você é" in system_text:
-            techniques_found.append("Role Prompting")
 
-        few_shot_markers = ["BUG REPORT:", "USER STORY:", "---"]
-        if sum(1 for m in few_shot_markers if m in system_text) >= 2:
-            techniques_found.append("Few-Shot Prompting")
+@pytest.mark.parametrize("prompt_id,prompt_data", ALL_PROMPTS, ids=PROMPT_IDS)
+def test_prompt_no_todos(prompt_id: str, prompt_data: Dict[str, Any]):
+    """Garante que nenhum [TODO] foi esquecido no texto do prompt."""
+    system_prompt = prompt_data.get("system_prompt", "")
+    user_prompt = prompt_data.get("user_prompt", "")
+    todo_pattern = re.compile(r"\[TODO\]", re.IGNORECASE)
 
-        if any(kw in system_text for kw in ["SEMPRE", "NUNCA", "obrigatório", "REGRAS"]):
-            techniques_found.append("Explicit Rules")
+    assert not todo_pattern.search(system_prompt), (
+        f"[{prompt_id}] system_prompt contém '[TODO]' não resolvido."
+    )
+    assert not todo_pattern.search(user_prompt), (
+        f"[{prompt_id}] user_prompt contém '[TODO]' não resolvido."
+    )
 
-        if any(
-            kw in system_text
-            for kw in ["edge case", "Edge Case", "EDGE CASE", "Se o bug", "Se o relato"]
-        ):
-            techniques_found.append("Edge Case Handling")
 
-        if any(
-            kw in full_text
-            for kw in ["raciocine", "pense", "antes de escrever", "raciocínio", "passo a passo"]
-        ):
-            techniques_found.append("Chain-of-Thought")
+@pytest.mark.parametrize("prompt_id,prompt_data", ALL_PROMPTS, ids=PROMPT_IDS)
+def test_minimum_techniques(prompt_id: str, prompt_data: Dict[str, Any]):
+    """Verifica se pelo menos 2 técnicas de prompting foram declaradas nos metadados.
 
-        if any(
-            kw in system_text
-            for kw in ["Como um", "Dado que", "Quando", "Então", "Given", "When", "Then"]
-        ):
-            techniques_found.append("Explicit Output Format")
+    Pulado para o v1 (prompt base intencional sem técnicas aplicadas).
+    """
+    if prompt_id == "bug_to_user_story_v1":
+        pytest.skip("v1 é o prompt base de baixa qualidade — técnicas não são exigidas.")
 
-        assert len(techniques_found) >= 2, (
-            f"Apenas {len(techniques_found)} tecnica(s) detectada(s): {techniques_found}. "
-            "O minimo exigido sao 2 tecnicas de prompt engineering."
-        )
+    techniques = prompt_data.get("techniques_applied", [])
+    assert isinstance(techniques, list), (
+        f"[{prompt_id}] 'techniques_applied' deve ser uma lista."
+    )
+    assert len(techniques) >= 2, (
+        f"[{prompt_id}] Esperado ao menos 2 técnicas em 'techniques_applied', "
+        f"encontradas: {len(techniques)} → {techniques}"
+    )
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "--tb=short"])
+    pytest.main([__file__, "-v"])

@@ -1,0 +1,10 @@
+agents:
+  bug_to_user_story_v1:
+    current_version: v1
+    path: bug_to_user_story_v1.yml
+    description: Prompt inicial para converter relatos de bugs em User Stories
+
+  bug_to_user_story_v2:
+    current_version: v2
+    path: bug_to_user_story_v2.yml
+    description: Prompt final aprovado — 4 exemplos few-shot + vocabulário obrigatório + recall

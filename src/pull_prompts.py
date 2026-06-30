@@ -6,76 +6,83 @@ Este script:
 2. Faz pull dos prompts do Hub
 3. Salva localmente em prompts/bug_to_user_story_v1.yml
 
-Usa Client.pull_prompt do langsmith (API canonica na versao 0.2.x)
-e serializa a ChatPromptTemplate em um formato YAML reutilizavel pelo
-restante do pipeline (push_prompts.py e tests/test_prompts.py).
+SIMPLIFICADO: Usa serialização nativa do LangChain para extrair prompts.
 """
 
+import os
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 from langsmith import Client
+from langchain_core.prompts import SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from utils import save_yaml, check_env_vars, print_section_header
 
 load_dotenv()
 
-SOURCE_PROMPT = "leonanluppi/bug_to_user_story_v1"
-TARGET_YAML = "prompts/bug_to_user_story_v1.yml"
-
-
-def prompt_to_dict(prompt) -> dict:
-    """Converte ChatPromptTemplate em dict serializavel para YAML.
-
-    Estrutura de saida:
-        input_variables: [<vars>]
-        messages:
-          - <role>: <template>
-          - ...
-    """
-    messages = []
-    for msg in prompt.messages:
-        role = msg.__class__.__name__.replace("MessagePromptTemplate", "").lower()
-        template = msg.prompt.template
-        messages.append({role: template})
-
-    return {
-        "input_variables": list(prompt.input_variables),
-        "messages": messages,
-    }
+PROMPT_REF = "leonanluppi/bug_to_user_story_v1"
+OUTPUT_PATH = Path(__file__).parent.parent / "prompts" / "bug_to_user_story_v1.yml"
 
 
 def pull_prompts_from_langsmith() -> bool:
-    """Faz pull do prompt v1 do Hub e salva em YAML local."""
-    print(f"Conectando ao LangSmith e puxando '{SOURCE_PROMPT}'...")
+    """
+    Conecta ao LangSmith, faz pull do prompt e salva localmente em YAML.
 
-    client = Client()
-    prompt = client.pull_prompt(SOURCE_PROMPT)
+    Returns:
+        True se sucesso, False caso contrário
+    """
+    print(f"Fazendo pull do prompt: {PROMPT_REF}")
 
-    data = prompt_to_dict(prompt)
-    success = save_yaml(data, TARGET_YAML)
+    try:
+        client = Client()
+        prompt = client.pull_prompt(PROMPT_REF, dangerously_pull_public_prompt=True)
 
-    if success:
-        print(f"   ✓ Prompt salvo em {TARGET_YAML}")
-        print(f"   Variaveis: {data['input_variables']}")
-        print(f"   Mensagens: {len(data['messages'])}")
-    return success
+        system_prompt = ""
+        user_prompt = ""
+
+        for message in prompt.messages:
+            if isinstance(message, SystemMessagePromptTemplate):
+                system_prompt = message.prompt.template
+            elif isinstance(message, HumanMessagePromptTemplate):
+                user_prompt = message.prompt.template
+
+        yaml_data = {
+            "bug_to_user_story_v1": {
+                "description": "Prompt para converter relatos de bugs em User Stories",
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "version": "v1",
+            }
+        }
+
+        if OUTPUT_PATH.exists():
+            print(f"⚠️  Arquivo já existia — será sobrescrito: {OUTPUT_PATH}")
+
+        print(f"Salvando em: {OUTPUT_PATH}")
+        success = save_yaml(yaml_data, str(OUTPUT_PATH))
+
+        if success:
+            print(f"✅ Prompt salvo com sucesso em {OUTPUT_PATH}")
+        else:
+            print("❌ Falha ao salvar o prompt")
+
+        return success
+
+    except Exception as e:
+        print(f"❌ Erro ao fazer pull do prompt: {e}")
+        return False
 
 
-def main() -> int:
-    """Funcao principal."""
-    print_section_header("PULL DE PROMPTS DO LANGSMITH HUB")
+def main():
+    """Função principal"""
+    print("=" * 50)
+    print("Pull de Prompts do LangSmith Hub")
+    print("=" * 50 + "\n")
 
     if not check_env_vars(["LANGSMITH_API_KEY"]):
         return 1
 
-    try:
-        if pull_prompts_from_langsmith():
-            print("\n✅ Pull concluido com sucesso!")
-            return 0
-        print("\n❌ Pull falhou ao salvar o YAML.")
-        return 1
-    except Exception as e:
-        print(f"\n❌ Erro ao fazer pull: {e}")
-        return 1
+    success = pull_prompts_from_langsmith()
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
